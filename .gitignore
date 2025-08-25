@@ -1,0 +1,23 @@
+﻿# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Env & secrets
+.env
+*.key
+
+# IDE/OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Data/outputs/build
+*.db
+*.sqlite
+dist/
+build/
+outputs/
+
+data/db_local.json
