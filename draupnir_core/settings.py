@@ -567,37 +567,6 @@ def settings_tab():
 
     st.divider()
 
-    # --- Projection Defaults ---
-    st.markdown("### 🌍 Projection Defaults")
-
-    base_currency = st.selectbox(
-        "Base Currency", BASE_CURRENCY_OPTIONS,
-        index=BASE_CURRENCY_OPTIONS.index(settings.get("base_currency", "CAD"))
-    )
-
-    market_data_provider = st.selectbox(
-        "Market Data Provider", MARKET_DATA_PROVIDER_OPTIONS,
-        index=MARKET_DATA_PROVIDER_OPTIONS.index(settings.get("market_data_provider", "yahoo"))
-    )
-
-    # --- Forecast output directory ---
-    st.markdown("### 📁 Output")
-    forecast_output_dir = st.text_input(
-        "Forecast Output Directory",
-        value=settings.get("forecast_output_dir", ""),
-        placeholder=r"C:\\Users\\you\\Documents\\Draupnir\\Forecasts (or /Users/you/Draupnir/Forecasts)"
-    )
-    if forecast_output_dir:
-        st.caption(f"Will save forecast Excel files to: `{os.path.abspath(forecast_output_dir)}`")
-
-    if st.button("💾 Save Settings"):
-        set_setting("base_currency", base_currency)
-        set_setting("market_data_provider", market_data_provider)
-        set_setting("forecast_output_dir", forecast_output_dir.strip())
-        st.success("✅ Settings saved.")
-
-    st.markdown("---")
-
     # ---- Create New Portfolio ----
     st.markdown("### 🆕 Create New Portfolio")
 
