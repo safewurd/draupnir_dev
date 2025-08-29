@@ -35,7 +35,7 @@ except Exception:
 
 # ---------------- Neon engine (import for side-effect consistency) ----------------
 # Your modules call get_engine() internally; importing keeps a single source of truth.
-from draupnir_core.db_config import get_engine  # noqa: F401
+from draupnir_core.db_config import get_engine, set_active_env, get_active_env  # noqa: F401
 
 # ---------------- Core modules ----------------
 from draupnir_core import settings as settings_mod
@@ -59,6 +59,17 @@ except Exception as ex:
 # ---------------- Header ----------------
 st.markdown("# 🧠 Draupnir Portfolio Management")
 st.markdown("Welcome to your private portfolio management and forecasting system.")
+
+# ---- UI toggle (main page): choose DB environment ----
+_current_env = get_active_env()
+_env_choice = st.radio(
+    "Environment",
+    options=["development", "production"],
+    index=0 if _current_env == "development" else 1,
+    help="Switch between your Neon dev and prod endpoints for this session.",
+    horizontal=True,
+)
+set_active_env(_env_choice)
 
 # Show a safe DB label (no password)
 st.caption(f"DB: `{get_db_label()}`")
