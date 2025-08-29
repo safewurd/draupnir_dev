@@ -10,8 +10,32 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------- Neon engine (no local DB path) ----------------
-from draupnir_core.db_config import get_engine  # ensures NEON_DB_URL is used
+# ---------------- DB label helper (Postgres/Neon) ----------------
+# Prefer get_db_label() from db_config if available; otherwise fallback here.
+try:
+    from draupnir_core.db_config import get_db_label  # uses .env and hides secrets
+except Exception:
+    from urllib.parse import urlparse
+
+    def get_db_label() -> str:
+        raw = (
+            os.getenv("NEON_DB_URL")
+            or os.getenv("DATABASE_URL")
+            or os.getenv("POSTGRES_URL")
+            or ""
+        )
+        if not raw:
+            return "(no DB configured)"
+        p = urlparse(raw)
+        vendor = "Postgres" if (p.scheme or "").startswith("postgres") else (p.scheme or "DB")
+        host = p.hostname or "?"
+        db = (p.path or "").lstrip("/") or "?"
+        user = p.username or "?"
+        return f"{vendor} @ {host}/{db} as {user}"
+
+# ---------------- Neon engine (import for side-effect consistency) ----------------
+# Your modules call get_engine() internally; importing keeps a single source of truth.
+from draupnir_core.db_config import get_engine  # noqa: F401
 
 # ---------------- Core modules ----------------
 from draupnir_core import settings as settings_mod
@@ -36,19 +60,8 @@ except Exception as ex:
 st.markdown("# 🧠 Draupnir Portfolio Management")
 st.markdown("Welcome to your private portfolio management and forecasting system.")
 
-# Show masked Neon URL so you can confirm where you're connected
-NEON_URL = os.getenv("NEON_DB_URL", "")
-masked = NEON_URL
-try:
-    if "://" in masked and "@" in masked:
-        left, right = masked.split("://", 1)
-        creds, rest = right.split("@", 1)
-        user = creds.split(":")[0]
-        masked = f"{left}://{user}:********@{rest}"
-except Exception:
-    masked = "(set NEON_DB_URL)"
-
-st.caption(f"DB: `{masked}`")
+# Show a safe DB label (no password)
+st.caption(f"DB: `{get_db_label()}`")
 
 # ---------------- Tabs ----------------
 tabs = st.tabs(["Summary", "Portfolio", "Trade Blotter", "Settings"])
