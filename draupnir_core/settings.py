@@ -1,166 +1,145 @@
-import streamlit as st
-import sqlite3
-import pandas as pd
+# draupnir_core/settings.py
+from __future__ import annotations
 import os
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple
 import math
+from typing import Optional, Dict, List, Tuple
 
+import streamlit as st
+import pandas as pd
+from sqlalchemy import text
 import yfinance as yf  # for yields/prices
 
-# per-machine DB config helper
-from draupnir_core.db_config import get_db_path, set_db_path_local, clear_db_path_local
-
-# ---- Unified DB path (now resolved per machine) ----
-os.makedirs("data", exist_ok=True)
-DB_PATH = get_db_path()  # absolute path for THIS machine
+# Use the shared Neon engine
+from draupnir_core.db_config import get_engine
 
 # ---------- Default Option Lists ----------
 BASE_CURRENCY_OPTIONS = ["CAD", "USD"]
 MARKET_DATA_PROVIDER_OPTIONS = ["yahoo", "alpha_vantage", "polygon"]
 
-# ---------- Column utilities / migrations ----------
-def _columns_in(conn: sqlite3.Connection, table: str) -> set[str]:
-    try:
-        rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
-        return {r[1] for r in rows}
-    except Exception:
-        return set()
-
-def _ensure_portfolios_columns(conn: sqlite3.Connection) -> None:
-    """
-    Add new portfolio-level yield and reinvest columns if missing.
-    Stored as:
-      - interest_yield, div_eligible_yield, div_noneligible_yield : REAL (e.g., 2.0 means 2%/yr)
-      - reinvest_interest, reinvest_dividends : INTEGER (1=true, 0=false), defaults 1
-    """
-    cols = _columns_in(conn, "portfolios")
-    add_sql = []
-    if "interest_yield" not in cols:
-        add_sql.append("ALTER TABLE portfolios ADD COLUMN interest_yield REAL;")
-    if "div_eligible_yield" not in cols:
-        add_sql.append("ALTER TABLE portfolios ADD COLUMN div_eligible_yield REAL;")
-    if "div_noneligible_yield" not in cols:
-        add_sql.append("ALTER TABLE portfolios ADD COLUMN div_noneligible_yield REAL;")
-    if "reinvest_interest" not in cols:
-        add_sql.append("ALTER TABLE portfolios ADD COLUMN reinvest_interest INTEGER DEFAULT 1;")
-    if "reinvest_dividends" not in cols:
-        add_sql.append("ALTER TABLE portfolios ADD COLUMN reinvest_dividends INTEGER DEFAULT 1;")
-    for sql in add_sql:
-        conn.execute(sql)
-    if add_sql:
-        conn.commit()
-
-# ---------- Table Management ----------
+# ---------- Schema management ----------
 def create_settings_tables():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # Primary key-value store used by this app
-    c.execute("""
+    """
+    Ensure required tables exist in Neon and seed dropdown defaults.
+    Safe to call multiple times (uses IF NOT EXISTS / ON CONFLICT).
+    """
+    engine = get_engine()
+    ddl = [
+        """
         CREATE TABLE IF NOT EXISTS global_settings (
-            key TEXT PRIMARY KEY,
+            key   TEXT PRIMARY KEY,
             value TEXT
-        )
-    """)
-
-    # Compatibility key-value table (some modules may read from 'settings')
-    c.execute("""
+        );
+        """,
+        """
         CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
+            key   TEXT PRIMARY KEY,
             value TEXT
-        )
-    """)
-
-    c.execute("""
+        );
+        """,
+        """
         CREATE TABLE IF NOT EXISTS institutions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id   SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL
-        )
-    """)
-
-    c.execute("""
+        );
+        """,
+        """
         CREATE TABLE IF NOT EXISTS tax_treatments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id   SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL
-        )
-    """)
-
-    # Ensure portfolios table exists (columns used by the app)
-    c.execute("""
+        );
+        """,
+        """
         CREATE TABLE IF NOT EXISTS portfolios (
-            portfolio_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            portfolio_owner TEXT,
-            institution TEXT,
-            tax_treatment TEXT,
-            account_number TEXT,
-            portfolio_name TEXT
-        )
-    """)
+            portfolio_id          SERIAL PRIMARY KEY,
+            portfolio_owner       TEXT,
+            institution           TEXT,
+            tax_treatment         TEXT,
+            account_number        TEXT,
+            portfolio_name        TEXT,
+            interest_yield        DOUBLE PRECISION,
+            div_eligible_yield    DOUBLE PRECISION,
+            div_noneligible_yield DOUBLE PRECISION,
+            reinvest_interest     INTEGER DEFAULT 1,
+            reinvest_dividends    INTEGER DEFAULT 1
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS trades (
+            trade_id        SERIAL PRIMARY KEY,
+            portfolio_id    INTEGER,
+            portfolio_name  TEXT,
+            ticker          TEXT,
+            currency        TEXT,
+            action          TEXT,
+            quantity        DOUBLE PRECISION,
+            price           DOUBLE PRECISION,
+            commission      DOUBLE PRECISION,
+            yahoo_symbol    TEXT,
+            trade_date      TIMESTAMPTZ
+        );
+        """,
+    ]
+    seeds = [
+        ("INSERT INTO institutions (name) VALUES (:n) ON CONFLICT (name) DO NOTHING", [
+            {"n": "RBC"}, {"n": "RBCDI"}, {"n": "Sunlife"}, {"n": "RBC Insurance"}
+        ]),
+        ("INSERT INTO tax_treatments (name) VALUES (:n) ON CONFLICT (name) DO NOTHING", [
+            {"n": "Taxable"}, {"n": "TFSA"}, {"n": "RRSP"}, {"n": "RESP"}, {"n": "RRIF"}
+        ]),
+    ]
+    with engine.begin() as conn:
+        for stmt in ddl:
+            conn.execute(text(stmt))
+        for sql, rows in seeds:
+            conn.execute(text(sql), rows)
 
-    # Auto-migrate portfolios to include yields & reinvest flags
-    _ensure_portfolios_columns(conn)
-
-    # Populate defaults if missing
-    c.executemany("INSERT OR IGNORE INTO institutions (name) VALUES (?)", [
-        ("RBC",), ("RBCDI",), ("Sunlife",), ("RBC Insurance",)
-    ])
-    c.executemany("INSERT OR IGNORE INTO tax_treatments (name) VALUES (?)", [
-        ("Taxable",), ("TFSA",), ("RRSP",), ("RESP",), ("RRIF",)
-    ])
-
-    conn.commit()
-    conn.close()
-
-# ---------- Settings DAO ----------
-def get_settings():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT key, value FROM global_settings", conn)
-    conn.close()
+# ---------- Settings DAO (key/value) ----------
+def get_settings() -> dict[str, str]:
+    engine = get_engine()
+    df = pd.read_sql_query("SELECT key, value FROM global_settings", engine)
     return dict(zip(df["key"], df["value"]))
 
-def set_setting(key, value):
-    """
-    Write to global_settings and mirror into settings (compat).
-    """
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("REPLACE INTO global_settings (key, value) VALUES (?, ?)", (key, value))
-    c.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value)
-    )
-    conn.commit()
-    conn.close()
+def set_setting(key: str, value: str) -> None:
+    engine = get_engine()
+    with engine.begin() as conn:
+        # keep both tables in sync for compatibility
+        conn.execute(text("""
+            INSERT INTO global_settings (key, value) VALUES (:k, :v)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """), {"k": key, "v": value})
+        conn.execute(text("""
+            INSERT INTO settings (key, value) VALUES (:k, :v)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """), {"k": key, "v": value})
 
 def get_setting_value(key: str) -> str | None:
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        row = conn.execute("SELECT value FROM global_settings WHERE key=? LIMIT 1;", (key,)).fetchone()
-        if row and row[0] is not None:
-            return str(row[0])
-        row2 = conn.execute("SELECT value FROM settings WHERE key=? LIMIT 1;", (key,)).fetchone()
-        if row2 and row2[0] is not None:
-            return str(row2[0])
-        return None
-    finally:
-        conn.close()
+    engine = get_engine()
+    with engine.connect() as conn:
+        r = conn.execute(text(
+            "SELECT value FROM global_settings WHERE key=:k LIMIT 1"
+        ), {"k": key}).fetchone()
+        if r and r[0] is not None:
+            return str(r[0])
+        r2 = conn.execute(text(
+            "SELECT value FROM settings WHERE key=:k LIMIT 1"
+        ), {"k": key}).fetchone()
+        return str(r2[0]) if (r2 and r2[0] is not None) else None
 
-def get_dropdown_list(table):
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(f"SELECT name FROM {table}", conn)
-    conn.close()
+# ---------- Dropdown helpers ----------
+def get_dropdown_list(table: str) -> list[str]:
+    engine = get_engine()
+    df = pd.read_sql_query(f"SELECT name FROM {table}", engine)
     return sorted(df["name"].tolist())
 
-def add_dropdown_option(table, name):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(f"INSERT OR IGNORE INTO {table} (name) VALUES (?)", (name,))
-    conn.commit()
-    conn.close()
+def add_dropdown_option(table: str, name: str) -> None:
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text(
+            f"INSERT INTO {table} (name) VALUES (:n) ON CONFLICT (name) DO NOTHING"
+        ), {"n": name})
 
-def load_portfolios_df(include_dist_cols: bool = True):
+# ---------- Portfolios ----------
+def load_portfolios_df(include_dist_cols: bool = True) -> pd.DataFrame:
     cols = [
         "portfolio_id","portfolio_name","portfolio_owner",
         "institution","tax_treatment","account_number"
@@ -170,25 +149,21 @@ def load_portfolios_df(include_dist_cols: bool = True):
             "interest_yield","div_eligible_yield","div_noneligible_yield",
             "reinvest_interest","reinvest_dividends"
         ]
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        return pd.read_sql_query(
-            f"SELECT {', '.join(cols)} FROM portfolios ORDER BY portfolio_name;",
-            conn
-        )
-    finally:
-        conn.close()
+    engine = get_engine()
+    return pd.read_sql_query(
+        f"SELECT {', '.join(cols)} FROM portfolios ORDER BY portfolio_name;",
+        engine
+    )
 
 def portfolio_exists(institution: str, account_number: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM portfolios WHERE institution=? AND account_number=? LIMIT 1;",
-            (institution, account_number)
-        ).fetchone()
-        return row is not None
-    finally:
-        conn.close()
+    engine = get_engine()
+    with engine.connect() as conn:
+        r = conn.execute(text("""
+            SELECT 1 FROM portfolios
+             WHERE institution=:i AND account_number=:a
+             LIMIT 1
+        """), {"i": str(institution).strip(), "a": account_number.strip()}).fetchone()
+        return r is not None
 
 def insert_portfolio(
     owner: str,
@@ -214,46 +189,43 @@ def insert_portfolio(
         str(tax_treatment).strip(),
         account_number.strip()
     ]
-    parts = [p for p in parts if p]  # drop empties
+    parts = [p for p in parts if p]
     portfolio_name = " - ".join(parts)
 
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        with conn:
-            cur = conn.execute(
-                "INSERT INTO portfolios (portfolio_owner, institution, tax_treatment, account_number, portfolio_name, "
-                "                         interest_yield, div_eligible_yield, div_noneligible_yield, "
-                "                         reinvest_interest, reinvest_dividends) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                (
-                    owner.strip(),
-                    str(institution).strip(),
-                    str(tax_treatment).strip(),
-                    account_number.strip(),
-                    portfolio_name,
-                    (None if interest_yield is None else float(interest_yield)),
-                    (None if div_eligible_yield is None else float(div_eligible_yield)),
-                    (None if div_noneligible_yield is None else float(div_noneligible_yield)),
-                    (1 if reinvest_interest else 0),
-                    (1 if reinvest_dividends else 0),
-                )
+    engine = get_engine()
+    with engine.begin() as conn:
+        new_id = conn.execute(text("""
+            INSERT INTO portfolios (
+              portfolio_owner, institution, tax_treatment, account_number, portfolio_name,
+              interest_yield, div_eligible_yield, div_noneligible_yield,
+              reinvest_interest, reinvest_dividends
             )
-            new_id = int(cur.lastrowid)
+            VALUES (:o,:i,:t,:a,:n,:iy,:de,:dne,:ri,:rd)
+            RETURNING portfolio_id
+        """), {
+            "o": owner.strip(),
+            "i": str(institution).strip(),
+            "t": str(tax_treatment).strip(),
+            "a": account_number.strip(),
+            "n": portfolio_name,
+            "iy": None if interest_yield is None else float(interest_yield),
+            "de": None if div_eligible_yield is None else float(div_eligible_yield),
+            "dne": None if div_noneligible_yield is None else float(div_noneligible_yield),
+            "ri": 1 if reinvest_interest else 0,
+            "rd": 1 if reinvest_dividends else 0,
+        }).scalar_one()
 
-            if set_default:
-                conn.execute(
-                    "INSERT INTO global_settings (key, value) VALUES ('default_portfolio_id', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-                    (str(new_id),)
-                )
-                conn.execute(
-                    "INSERT INTO settings (key, value) VALUES ('default_portfolio_id', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value;",
-                    (str(new_id),)
-                )
-        return new_id
-    finally:
-        conn.close()
+        if set_default:
+            conn.execute(text("""
+                INSERT INTO global_settings (key, value) VALUES ('default_portfolio_id', :v)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """), {"v": str(new_id)})
+            conn.execute(text("""
+                INSERT INTO settings (key, value) VALUES ('default_portfolio_id', :v)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """), {"v": str(new_id)})
+
+    return int(new_id)
 
 def update_portfolio_distribution_settings(df: pd.DataFrame) -> None:
     """
@@ -263,60 +235,50 @@ def update_portfolio_distribution_settings(df: pd.DataFrame) -> None:
     """
     if df.empty:
         return
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        with conn:
-            rows = []
-            for r in df.itertuples(index=False):
-                pid = int(getattr(r, "portfolio_id"))
-                iy  = getattr(r, "interest_yield", None)
-                de  = getattr(r, "div_eligible_yield", None)
-                dne = getattr(r, "div_noneligible_yield", None)
-                ri  = getattr(r, "reinvest_interest", False)
-                rd  = getattr(r, "reinvest_dividends", False)
-                rows.append((
-                    float(iy) if iy is not None else None,
-                    float(de) if de is not None else None,
-                    float(dne) if dne is not None else None,
-                    1 if bool(ri) else 0,
-                    1 if bool(rd) else 0,
-                    pid
-                ))
-            conn.executemany("""
-                UPDATE portfolios
-                SET interest_yield = ?,
-                    div_eligible_yield = ?,
-                    div_noneligible_yield = ?,
-                    reinvest_interest = ?,
-                    reinvest_dividends = ?
-                WHERE portfolio_id = ?;
-            """, rows)
-    finally:
-        conn.close()
+
+    rows = []
+    for r in df.itertuples(index=False):
+        pid = int(getattr(r, "portfolio_id"))
+        iy  = getattr(r, "interest_yield", None)
+        de  = getattr(r, "div_eligible_yield", None)
+        dne = getattr(r, "div_noneligible_yield", None)
+        ri  = getattr(r, "reinvest_interest", False)
+        rd  = getattr(r, "reinvest_dividends", False)
+        rows.append({
+            "iy":  None if iy  is None else float(iy),
+            "de":  None if de  is None else float(de),
+            "dne": None if dne is None else float(dne),
+            "ri":  1 if bool(ri) else 0,
+            "rd":  1 if bool(rd) else 0,
+            "pid": pid,
+        })
+
+    engine = get_engine()
+    sql = text("""
+        UPDATE portfolios
+           SET interest_yield = :iy,
+               div_eligible_yield = :de,
+               div_noneligible_yield = :dne,
+               reinvest_interest = :ri,
+               reinvest_dividends = :rd
+         WHERE portfolio_id = :pid
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql, rows)
 
 # ---------- Yahoo helpers for weighted-average yields ----------
 CAD_SUFFIXES = (".TO", ".V", ".NE", ".CN")
 
-def _connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
 def _load_trades() -> pd.DataFrame:
-    conn = _connect(DB_PATH)
+    engine = get_engine()
     try:
-        try:
-            df = pd.read_sql("""
-                SELECT trade_id, portfolio_id, portfolio_name, ticker, currency, action, quantity, price,
-                       commission, yahoo_symbol, trade_date
-                FROM trades
-            """, conn)
-        except Exception:
-            return pd.DataFrame()
-    finally:
-        conn.close()
-
+        df = pd.read_sql("""
+            SELECT trade_id, portfolio_id, portfolio_name, ticker, currency, action, quantity, price,
+                   commission, yahoo_symbol, trade_date
+            FROM trades
+        """, engine)
+    except Exception:
+        return pd.DataFrame()
     if df.empty:
         return df
 
@@ -330,7 +292,10 @@ def _load_trades() -> pd.DataFrame:
 
     # Signed qty
     df["action_up"] = df["action"].str.upper()
-    df["signed_qty"] = df.apply(lambda r: r["quantity"] * (1.0 if r["action_up"] == "BUY" else (-1.0 if r["action_up"] == "SELL" else 0.0)), axis=1)
+    df["signed_qty"] = df.apply(
+        lambda r: r["quantity"] * (1.0 if r["action_up"] == "BUY" else (-1.0 if r["action_up"] == "SELL" else 0.0)),
+        axis=1
+    )
     return df
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -389,17 +354,8 @@ def _classify_symbol_for_yields(info: Dict, symbol: str) -> Tuple[bool, bool]:
 
     return fixed_income_like, is_cad_listed
 
-# ---- NEW: normalize Yahoo values to DECIMAL (0.027 for 2.7%) ----
+# ---- Normalize yields to DECIMAL (0.027 for 2.7%) ----
 def _normalize_to_decimal(val):
-    """
-    Normalize a yield value to DECIMAL form (0.027 for 2.7%).
-    Yahoo fields:
-      - info['dividendYield'] is usually decimal already (0.027)
-      - info['yield'] (on funds) is often PERCENT (2.7), but not always
-    Heuristic:
-      - Convert to float; if > 1.0, assume percent and divide by 100
-      - If still > 0.5 (50%), divide by 100 again (defensive)
-    """
     if val is None:
         return None
     try:
@@ -408,26 +364,19 @@ def _normalize_to_decimal(val):
         return None
     if y > 1.0:
         y = y / 100.0
-    if y > 0.5:  # >50% is almost certainly percent mislabeled as decimal
+    if y > 0.5:  # >50% defensive
         y = y / 100.0
     if y < 0:
         return None
     return y
 
 def _div_yield_from_info(info: Dict) -> Optional[float]:
-    # Usually DECIMAL already (e.g., 0.041 = 4.1%)
     return _normalize_to_decimal(info.get("dividendYield", None))
 
 def _fund_yield_from_info(info: Dict) -> Optional[float]:
-    # Often PERCENT on funds (e.g., 2.7 = 2.7%), normalize it
     return _normalize_to_decimal(info.get("yield", None))
 
 def _compute_weighted_yields_for_all_portfolios() -> Tuple[pd.DataFrame, Dict[int, List[str]]]:
-    """
-    Returns:
-      df with columns [portfolio_id, interest_yield, div_eligible_yield, div_noneligible_yield] (percent values)
-      missing: dict {portfolio_id: [symbols_without_yield_info]}
-    """
     trades = _load_trades()
     if trades.empty:
         return pd.DataFrame(), {}
@@ -445,29 +394,20 @@ def _compute_weighted_yields_for_all_portfolios() -> Tuple[pd.DataFrame, Dict[in
     grp["price"] = grp["symbol"].apply(_fetch_last_close)
     grp["mkt_value"] = grp["signed_qty"] * grp["price"].fillna(0.0)
 
-    # Get yahoo info fields we care about
     infos = {symb: _fetch_info(symb) for symb in grp["symbol"].unique().tolist()}
     grp["info"] = grp["symbol"].map(infos)
 
-    # Pull raw yields (normalized to DECIMAL)
     grp["div_yield_dec"] = grp["info"].apply(_div_yield_from_info)
     grp["fund_yield_dec"] = grp["info"].apply(_fund_yield_from_info)
 
-    # Classify per security
     grp[["is_fixed_income_like","is_cad_listed"]] = grp.apply(
         lambda r: pd.Series(_classify_symbol_for_yields(r["info"], r["symbol"])), axis=1
     )
 
-    # Initialize buckets (DECIMAL, not percent yet)
     grp["interest_component"] = 0.0
     grp["eligible_div_component"] = 0.0
     grp["noneligible_div_component"] = 0.0
 
-    # Heuristics:
-    # - If fixed-income-like:
-    #     use fund_yield_dec when available; else if div_yield_dec exists, treat it as interest (bond ETFs sometimes show dividends)
-    # - Else (equity-like):
-    #     use div_yield_dec as dividend; split eligible vs non-eligible by exchange suffix (CAD-listed → eligible)
     def _assign_components(row):
         mv = float(row["mkt_value"] or 0.0)
         if mv <= 0 or (math.isfinite(mv) is False):
@@ -500,7 +440,6 @@ def _compute_weighted_yields_for_all_portfolios() -> Tuple[pd.DataFrame, Dict[in
     grp["eligible_div_amt"] = comps[1]
     grp["noneligible_div_amt"] = comps[2]
 
-    # Sum by portfolio
     agg = grp.groupby("portfolio_id", as_index=False).agg(
         mkt_value=("mkt_value","sum"),
         interest_amt=("interest_amt","sum"),
@@ -508,18 +447,15 @@ def _compute_weighted_yields_for_all_portfolios() -> Tuple[pd.DataFrame, Dict[in
         noneligible_div_amt=("noneligible_div_amt","sum"),
     )
 
-    # Weighted average yields (convert to PERCENT values)
     def _pct(x): return (x * 100.0)
     agg["interest_yield"] = agg.apply(lambda r: _pct(r["interest_amt"] / r["mkt_value"]) if r["mkt_value"] else 0.0, axis=1)
     agg["div_eligible_yield"] = agg.apply(lambda r: _pct(r["eligible_div_amt"] / r["mkt_value"]) if r["mkt_value"] else 0.0, axis=1)
     agg["div_noneligible_yield"] = agg.apply(lambda r: _pct(r["noneligible_div_amt"] / r["mkt_value"]) if r["mkt_value"] else 0.0, axis=1)
 
-    # Find missing symbols (no price or no yield signal at all)
     missing: Dict[int, List[str]] = {}
     for pid, g in grp.groupby("portfolio_id"):
         miss_syms: List[str] = []
         for _, r in g.iterrows():
-            # consider missing if neither fund_yield nor div_yield available
             if r["price"] is None:
                 miss_syms.append(str(r["symbol"]))
                 continue
@@ -533,37 +469,29 @@ def _compute_weighted_yields_for_all_portfolios() -> Tuple[pd.DataFrame, Dict[in
 
 # ---------- UI Tab ----------
 def settings_tab():
+    # Ensure schema exists in Neon
     create_settings_tables()
     settings = get_settings()
 
-    # --- Database Location (this machine only) ---
-    st.markdown("### 📦 Database Location (this machine)")
-    st.caption("Set where this computer should read/write the SQLite DB. Not committed to Git.")
-    st.text_input("Current DB path", value=str(DB_PATH), disabled=True)
-
-    colA, colB = st.columns(2)
-    with colA:
-        new_path = st.text_input(
-            "Set DB file path (absolute path or dropbox://Apps/draupnir/data/draupnir.db)",
-            placeholder=r"N:\Dropbox\Apps\draupnir\data\draupnir.db  or  dropbox://Apps\draupnir\data\draupnir.db"
-        )
-        copy_first = st.checkbox("If target is new, copy current DB there once", value=True)
-        if st.button("💾 Use This Path (This Machine Only)"):
-            try:
-                resolved = set_db_path_local(new_path.strip(), copy_if_needed=copy_first)
-                st.success(f"DB path saved for this machine:\n{resolved}")
-                st.info("Restart app or reload page to apply.")
-            except Exception as e:
-                st.error(f"Failed to set DB path: {e}")
-
-    with colB:
-        if st.button("↩️ Switch Back to Local (data/draupnir.db)"):
-            try:
-                clear_db_path_local()
-                st.success("Switched to local DB: data/draupnir.db")
-                st.info("Restart app or reload page to apply.")
-            except Exception as e:
-                st.error(f"Failed to clear local DB override: {e}")
+    # --- Database Location / Connection (Neon) ---
+    st.markdown("### 📦 Database Connection")
+    neon_url = os.getenv("NEON_DB_URL", "")
+    if neon_url:
+        # show host/db only (mask password)
+        try:
+            # crude masking to avoid showing secrets
+            shown = neon_url
+            if "://" in shown and "@" in shown:
+                left, right = shown.split("://", 1)
+                creds, rest = right.split("@", 1)
+                user = creds.split(":")[0]
+                shown = f"{left}://{user}:********@{rest}"
+        except Exception:
+            shown = "***"
+        st.text_input("Connected URL (read-only)", value=shown, disabled=True)
+        st.caption("This app writes to a remote Neon Postgres database via NEON_DB_URL.")
+    else:
+        st.error("NEON_DB_URL is not set. Please set it in your environment / secrets and restart the app.")
 
     st.divider()
 
@@ -598,7 +526,6 @@ def settings_tab():
         reinvest_dividends = st.checkbox("Reinvest dividends", value=True)
 
     if st.button("➕ Create Portfolio", type="primary"):
-        # Validation
         errs = []
         if not owner.strip():
             errs.append("Owner is required.")
@@ -661,14 +588,12 @@ def settings_tab():
         ]
         show_cols = [c for c in show_cols if c in pf_df.columns]
 
-        # Use a separate session_state buffer for the editor's data
         buffer_key = "portfolio_dist_editor_df"
         editor_key = "portfolio_dist_editor"
 
         if buffer_key not in st.session_state:
             st.session_state[buffer_key] = pf_df[show_cols].copy()
 
-        # Render editor from the buffer (do not mutate editor_key in session_state directly)
         edited = st.data_editor(
             st.session_state[buffer_key],
             use_container_width=True,
@@ -685,7 +610,6 @@ def settings_tab():
                 if auto_df.empty:
                     st.warning("No holdings found or unable to compute yields. You can edit values manually below.")
                 else:
-                    # Merge computed yields into the BUFFER (not the widget key)
                     merged = st.session_state[buffer_key].merge(
                         auto_df,
                         on="portfolio_id",
@@ -698,8 +622,7 @@ def settings_tab():
                             merged[k] = merged[k_auto].where(merged[k_auto].notna(), merged[k])
                             merged.drop(columns=[k_auto], inplace=True, errors="ignore")
 
-                    st.session_state[buffer_key] = merged  # update the buffer
-                    # Show prompts for manual entry if some symbols had no yield info
+                    st.session_state[buffer_key] = merged
                     if missing:
                         msgs = []
                         for pid, syms in missing.items():
@@ -715,14 +638,12 @@ def settings_tab():
                             )
                         else:
                             st.info("Fetched yields applied. Review and adjust if needed, then click **Save Changes**.")
-                    st.rerun()  # re-render editor with new buffer data
+                    st.rerun()
 
         with col_btn2:
             if st.button("💾 Save Changes", type="primary", key="btn_save_portfolio_dist"):
                 try:
-                    # Persist modifications returned by the editor
                     update_portfolio_distribution_settings(edited if isinstance(edited, pd.DataFrame) else st.session_state[buffer_key])
-                    # Keep buffer in sync with latest saved edits
                     st.session_state[buffer_key] = (edited if isinstance(edited, pd.DataFrame) else st.session_state[buffer_key])
                     st.success("✅ Portfolio settings updated.")
                 except Exception as ex:
@@ -762,7 +683,6 @@ def settings_tab():
 
     # ---- Manage Institutions ----
     st.markdown("### 🏦 Manage Institutions")
-
     institution_list = get_dropdown_list("institutions")
     st.selectbox("Existing Institutions", institution_list)
 
@@ -776,7 +696,6 @@ def settings_tab():
 
     # ---- Manage Tax Treatments ----
     st.markdown("### 🧾 Manage Tax Treatments")
-
     tax_list = get_dropdown_list("tax_treatments")
     st.selectbox("Existing Tax Treatments", tax_list)
 

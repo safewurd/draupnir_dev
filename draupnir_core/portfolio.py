@@ -1,18 +1,15 @@
-import sqlite3
 import math
 from functools import lru_cache
-from typing import Dict, Optional, List, Iterable
+from typing import Dict, Optional, List, Iterable, Tuple
 from io import BytesIO
 from datetime import datetime
-import os
 
 import pandas as pd
 import yfinance as yf
 import streamlit as st
+from sqlalchemy import text, inspect
 
-# ---- Unified DB path ----
-os.makedirs("data", exist_ok=True)
-DB_PATH = os.path.join("data", "draupnir.db")
+from draupnir_core.db_config import get_engine
 
 # =========================
 # Quiet Yahoo helpers
@@ -51,108 +48,197 @@ def resolve_yahoo_symbol(ticker: str, currency: str) -> Optional[str]:
     return t
 
 # =========================
-# DB I/O
+# DB helpers (Neon via SQLAlchemy)
 # =========================
 
-def _connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-def _read_table(conn, name: str) -> pd.DataFrame:
+def _table_columns(table_name: str) -> List[str]:
+    engine = get_engine()
+    insp = inspect(engine)
     try:
-        return pd.read_sql_query(f"SELECT * FROM {name}", conn)
+        return [c["name"] for c in insp.get_columns(table_name)]
+    except Exception:
+        return []
+
+def _read_table(name: str, columns: Optional[List[str]] = None) -> pd.DataFrame:
+    engine = get_engine()
+    cols_sql = ", ".join(columns) if columns else "*"
+    try:
+        return pd.read_sql_query(f"SELECT {cols_sql} FROM {name}", engine)
     except Exception:
         return pd.DataFrame()
 
-def load_trades(db_path: str) -> pd.DataFrame:
-    conn = _connect(db_path)
-    df = _read_table(conn, "trades")
-    conn.close()
+# =========================
+# Base currency + FX helpers
+# =========================
 
+def _read_settings_base_currency() -> Optional[str]:
+    try:
+        eng = get_engine()
+        with eng.connect() as conn:
+            r = conn.execute(text(
+                "SELECT value FROM global_settings WHERE key IN ('base_currency','BASE_CURRENCY') LIMIT 1"
+            )).fetchone()
+            if r and r[0]:
+                return str(r[0]).strip().upper()
+            r2 = conn.execute(text(
+                "SELECT value FROM settings WHERE key IN ('base_currency','BASE_CURRENCY') LIMIT 1"
+            )).fetchone()
+            if r2 and r2[0]:
+                return str(r2[0]).strip().upper()
+    except Exception:
+        return None
+    return None
+
+def _get_base_currency() -> str:
+    base = _read_settings_base_currency()
+    if base in ("CAD", "USD"):
+        return base
+    return "CAD"
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _fetch_fx_pair(symbol: str) -> Optional[float]:
+    try:
+        hist = yf.Ticker(symbol).history(period="1d", auto_adjust=False, actions=False, raise_errors=False)
+        if hist.empty or "Close" not in hist.columns:
+            return None
+        close = hist["Close"].dropna()
+        return float(close.iloc[-1]) if not close.empty else None
+    except Exception:
+        return None
+
+def _fx_to_base_rates(base: str) -> Dict[str, float]:
+    """
+    Return a mapping { 'CAD': rate_to_base, 'USD': rate_to_base }.
+    If base == CAD: USD value → *USDCAD*, CAD → *1.0*
+    If base == USD: CAD value → *CADUSD*, USD → *1.0*
+    """
+    base = (base or "").upper()
+    rates = {"CAD": 1.0, "USD": 1.0}
+    if base == "CAD":
+        r = _fetch_fx_pair("USDCAD=X")
+        rates["USD"] = r if r and r > 0 else 1.35
+    elif base == "USD":
+        r = _fetch_fx_pair("CADUSD=X")
+        rates["CAD"] = r if r and r > 0 else 0.74
+    return rates
+
+# =========================
+# Loads
+# =========================
+
+def load_trades(_: Optional[str] = None) -> pd.DataFrame:
+    cols = _table_columns("trades")
+    wanted = [
+        "trade_id","portfolio_id","portfolio_name","ticker","currency",
+        "action","quantity","price","commission","yahoo_symbol","trade_date",
+    ]
+    for opt in ["account_number","created_at","trade_value_cad","trade_value_usd","trade_usdcad"]:
+        if opt in cols:
+            wanted.append(opt)
+
+    df = _read_table("trades", [c for c in wanted if c in cols])
     if df.empty:
-        return pd.DataFrame(columns=[
-            "trade_id","portfolio_id","portfolio_name","account_number","ticker","currency",
-            "action","quantity","price","commission","yahoo_symbol","trade_date","created_at"
-        ])
+        # keep the same shape
+        for c in wanted:
+            if c not in df.columns:
+                df[c] = pd.Series(dtype="object")
+        return df[wanted]
 
     def norm_str(series):
         return series.astype(str).str.strip().str.upper()
 
-    for col in ["portfolio_name","ticker","currency","action","yahoo_symbol","account_number"]:
+    for col in ["portfolio_name","ticker","currency","action","yahoo_symbol"]:
         if col in df.columns:
             df[col] = norm_str(df[col])
         else:
             df[col] = ""
 
-    for col in ["quantity","price","commission"]:
+    for col in ["quantity","price","commission","trade_value_cad","trade_value_usd","trade_usdcad"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        else:
-            df[col] = 0.0
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "portfolio_id" in df.columns:
         df["portfolio_id"] = pd.to_numeric(df["portfolio_id"], errors="coerce").astype("Int64")
-    else:
-        df["portfolio_id"] = pd.NA
-
     if "trade_id" in df.columns:
         df["trade_id"] = pd.to_numeric(df["trade_id"], errors="coerce").astype("Int64")
-    else:
-        df["trade_id"] = pd.NA
 
-    return df
+    return df[[c for c in wanted if c in df.columns]]
 
-def load_portfolios(db_path: str) -> pd.DataFrame:
-    conn = _connect(db_path)
-    try:
-        return _read_table(conn, "portfolios")
-    finally:
-        conn.close()
+def load_portfolios(_: Optional[str] = None) -> pd.DataFrame:
+    cols = _table_columns("portfolios")
+    wanted = [
+        "portfolio_id", "portfolio_name", "account_number",
+        "portfolio_owner", "institution", "tax_treatment",
+        "interest_yield", "div_eligible_yield", "div_noneligible_yield",
+        "reinvest_interest", "reinvest_dividends"
+    ]
+    wanted = [c for c in wanted if c in cols]
+    return _read_table("portfolios", wanted)
 
-def backfill_yahoo_symbols(db_path: str, trades_df: pd.DataFrame) -> None:
+def backfill_yahoo_symbols(db_path_unused: Optional[str], trades_df: pd.DataFrame) -> None:
     if trades_df.empty or "trade_id" not in trades_df.columns:
         return
-    missing = (trades_df["yahoo_symbol"].isna()) | (trades_df["yahoo_symbol"].str.strip() == "")
+    if "yahoo_symbol" not in trades_df.columns:
+        return
+    missing = (trades_df["yahoo_symbol"].isna()) | (trades_df["yahoo_symbol"].astype(str).str.strip() == "")
     candidates = trades_df.loc[missing, ["trade_id","ticker","currency"]].dropna(subset=["trade_id"])
     if candidates.empty:
         return
-    updates: List[tuple] = []
+
+    updates: List[dict] = []
     for _, r in candidates.iterrows():
         sym = resolve_yahoo_symbol(str(r["ticker"]), str(r["currency"]))
         if sym and _has_price_data(sym):
-            updates.append((sym, int(r["trade_id"])))
+            updates.append({"sym": sym, "tid": int(r["trade_id"])})
+
     if not updates:
         return
-    conn = _connect(db_path)
-    try:
-        with conn:
-            conn.executemany("UPDATE trades SET yahoo_symbol = ? WHERE trade_id = ?", updates)
-    finally:
-        conn.close()
+
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE trades SET yahoo_symbol = :sym WHERE trade_id = :tid"), updates)
 
 # =========================
-# Aggregation & valuation
+# Aggregation using trade_value_* as Book Value
 # =========================
 
 def aggregate_positions(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns one row per (portfolio_key, effective_symbol) with:
+      - current_qty
+      - book_value_cad, book_value_usd (from signed sums of trade_value_* by action)
+      - metadata (ticker, currency, yahoo_symbol, portfolio_id/name)
+    """
     if trades.empty:
         return pd.DataFrame()
 
-    sym = trades["yahoo_symbol"].str.strip()
+    # Resolve effective symbol
+    sym = trades["yahoo_symbol"].astype(str).str.strip()
     missing = sym.isna() | (sym == "")
     if missing.any():
         sym.loc[missing] = trades.loc[missing].apply(
-            lambda r: resolve_yahoo_symbol(r["ticker"], r["currency"]), axis=1
+            lambda r: resolve_yahoo_symbol(str(r["ticker"]), str(r["currency"])), axis=1
         )
     trades = trades.assign(effective_symbol=sym.fillna(""))
 
+    # Signed quantity and signed trade values
     sign = trades["action"].map(lambda a: 1.0 if a == "BUY" else (-1.0 if a == "SELL" else 0.0))
     trades = trades.assign(signed_qty=trades["quantity"] * sign)
 
+    if "trade_value_cad" in trades.columns:
+        trades["signed_value_cad"] = pd.to_numeric(trades["trade_value_cad"], errors="coerce").fillna(0.0) * sign
+    else:
+        trades["signed_value_cad"] = 0.0
+
+    if "trade_value_usd" in trades.columns:
+        trades["signed_value_usd"] = pd.to_numeric(trades["trade_value_usd"], errors="coerce").fillna(0.0) * sign
+    else:
+        trades["signed_value_usd"] = 0.0
+
+    # If portfolio_id missing, fall back to name as the grouping key
     trades["portfolio_key"] = trades["portfolio_id"].where(trades["portfolio_id"].notna(), trades["portfolio_name"])
 
+    # Aggregate quantity and book values
     qty = (
         trades.groupby(["portfolio_key","effective_symbol"], dropna=False)["signed_qty"]
         .sum()
@@ -160,23 +246,16 @@ def aggregate_positions(trades: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"signed_qty": "current_qty"})
     )
 
-    buys = trades[trades["action"] == "BUY"].copy()
-    buys["buy_cost"] = buys["quantity"] * buys["price"]
-    book = buys.groupby(["portfolio_key","effective_symbol"], dropna=False).agg(
-        total_buy_qty=("quantity","sum"),
-        total_buy_cost=("buy_cost","sum"),
+    book = trades.groupby(["portfolio_key","effective_symbol"], dropna=False).agg(
+        book_value_cad=("signed_value_cad","sum"),
+        book_value_usd=("signed_value_usd","sum"),
     ).reset_index()
 
     pos = qty.merge(book, on=["portfolio_key","effective_symbol"], how="left").fillna({
-        "total_buy_qty": 0.0, "total_buy_cost": 0.0
+        "book_value_cad": 0.0, "book_value_usd": 0.0
     })
-    pos["avg_book_price"] = pos.apply(
-        lambda r: (r["total_buy_cost"] / r["total_buy_qty"]) if r["total_buy_qty"] > 0 else None, axis=1
-    )
-    pos["book_value"] = pos.apply(
-        lambda r: (r["current_qty"] * r["avg_book_price"]) if r["avg_book_price"] is not None else None, axis=1
-    )
 
+    # Meta for display
     meta = trades.groupby(["portfolio_key","effective_symbol"], dropna=False).agg(
         display_ticker=("ticker","first"),
         currency=("currency","first"),
@@ -190,8 +269,12 @@ def aggregate_positions(trades: pd.DataFrame) -> pd.DataFrame:
     return pos[[
         "portfolio_key","portfolio_id","trade_portfolio_name",
         "display_ticker","currency","yahoo_symbol","effective_symbol",
-        "current_qty","avg_book_price","book_value"
+        "current_qty","book_value_cad","book_value_usd"
     ]]
+
+# =========================
+# Pricing & Valuation to Base
+# =========================
 
 @st.cache_data(show_spinner=False, ttl=60)
 def _fetch_price_single(sym: str, cache_buster: str = "") -> Optional[float]:
@@ -215,21 +298,59 @@ def fetch_prices(symbols: Iterable[str]) -> Dict[str, Optional[float]]:
     return out
 
 def value_positions(pos: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes live price, Market Value (base), Book Value (base),
+    Gain/Loss (base), Return % (base).
+    """
     if pos.empty:
         return pos
+
+    base = _get_base_currency()
+    fx = _fx_to_base_rates(base)
+
     pos = pos.copy()
+
+    # live prices (native)
     price_map = fetch_prices(pos["effective_symbol"].fillna("").tolist())
-    pos["live_price"] = pos["effective_symbol"].map(price_map)
-    pos["market_value"] = pos.apply(
-        lambda r: (r["current_qty"] * r["live_price"]) if (r["live_price"] is not None) else None, axis=1
-    )
-    pos["gain_loss"] = pos.apply(
-        lambda r: (r["market_value"] - r["book_value"]) if (r["market_value"] is not None and r["book_value"] is not None) else None, axis=1
-    )
-    pos["return_pct"] = pos.apply(
-        lambda r: (100.0 * r["gain_loss"] / r["book_value"]) if (r.get("gain_loss") is not None and r.get("book_value") not in (None, 0)) else None,
+    pos["live_price_native"] = pos["effective_symbol"].map(price_map)
+
+    # Market Value in base currency
+    def _mv_base(row) -> Optional[float]:
+        qty = float(row.get("current_qty") or 0.0)
+        px  = row.get("live_price_native")
+        if pd.isna(px):
+            return None
+        cur = str(row.get("currency","")).upper()
+        rate = fx.get(cur, 1.0)
+        return qty * float(px) * float(rate)
+
+    pos["market_value_base"] = pos.apply(_mv_base, axis=1)
+
+    # Book Value in base currency from trade_value_* sums
+    if base == "CAD":
+        pos["book_value_base"] = pd.to_numeric(pos["book_value_cad"], errors="coerce").fillna(0.0)
+    else:
+        pos["book_value_base"] = pd.to_numeric(pos["book_value_usd"], errors="coerce").fillna(0.0)
+
+    # Fallback: if book_value_base is all zeros (e.g., legacy table w/o new cols), estimate from buys
+    if (pos["book_value_base"].abs().sum() == 0) and ("live_price_native" in pos.columns):
+        # crude fallback: treat avg_book_price = last close (not ideal, but preserves UX)
+        pos["book_value_base"] = 0.0  # leave zero rather than fabricate
+
+    # Gain/Loss and Return in base
+    pos["gain_loss_base"] = pos.apply(
+        lambda r: (r["market_value_base"] - r["book_value_base"])
+        if (pd.notna(r.get("market_value_base")) and pd.notna(r.get("book_value_base")))
+        else None,
         axis=1
     )
+    pos["return_pct_base"] = pos.apply(
+        lambda r: (100.0 * r["gain_loss_base"] / r["book_value_base"])
+        if (pd.notna(r.get("gain_loss_base")) and pd.notna(r.get("book_value_base")) and r["book_value_base"] != 0)
+        else None,
+        axis=1
+    )
+
     return pos
 
 # =========================
@@ -240,77 +361,59 @@ def _format_holdings(df: pd.DataFrame):
     if df.empty:
         return df.style
     df = df.copy()
-    for col in ["current_qty","avg_book_price","live_price","book_value","market_value","gain_loss","return_pct"]:
+    numeric_cols = [
+        "current_qty","book_value_base","market_value_base","gain_loss_base","return_pct_base",
+        "live_price_native"
+    ]
+    for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
     if "current_qty" in df.columns:
         df["current_qty"] = df["current_qty"].apply(lambda x: math.floor(x) if pd.notna(x) else x)
+
     fmt = {}
     if "current_qty" in df.columns:
         fmt["current_qty"] = "{:,.0f}".format
-    for c in ["avg_book_price","live_price","book_value","market_value","gain_loss"]:
+    for c in ["book_value_base","market_value_base","gain_loss_base","live_price_native"]:
         if c in df.columns:
             fmt[c] = "{:,.2f}".format
-    if "return_pct" in df.columns:
-        fmt["return_pct"] = (lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
+    if "return_pct_base" in df.columns:
+        fmt["return_pct_base"] = (lambda x: "" if pd.isna(x) else f"{float(x):.1f}%")
     return df.style.format(fmt, na_rep="")
 
 def _render_summary_bar(valued: pd.DataFrame):
     if valued.empty:
         return
-    book_total = pd.to_numeric(valued["book_value"], errors="coerce").sum()
-    mkt_total  = pd.to_numeric(valued["market_value"], errors="coerce").sum()
-    gl_total   = pd.to_numeric(valued["gain_loss"], errors="coerce").sum()
+    book_total = pd.to_numeric(valued["book_value_base"], errors="coerce").sum()
+    mkt_total  = pd.to_numeric(valued["market_value_base"], errors="coerce").sum()
+    gl_total   = pd.to_numeric(valued["gain_loss_base"], errors="coerce").sum()
     ret_pct = None
     if book_total and book_total != 0:
         ret_pct = (gl_total / book_total) * 100.0
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Book Value",   f"{book_total:,.2f}")
-    c2.metric("Market Value", f"{mkt_total:,.2f}")
-    c3.metric("Gain / Loss",  f"{gl_total:,.2f}")
-    c4.metric("Return %",     ("" if ret_pct is None else f"{ret_pct:.1f}%"))
+    c1.metric("Book Value (Base)",   f"{book_total:,.2f}")
+    c2.metric("Market Value (Base)", f"{mkt_total:,.2f}")
+    c3.metric("Gain / Loss (Base)",  f"{gl_total:,.2f}")
+    c4.metric("Return %",            ("" if ret_pct is None else f"{ret_pct:.1f}%"))
 
 # =========================
-# Settings helpers (read default portfolio)
+# Settings helpers (default portfolio)
 # =========================
 
 def _read_default_portfolio_id() -> Optional[int]:
-    """
-    Read default portfolio id from a settings table.
-    Supports:
-      - key/value table: key='default_portfolio_id'
-      - wide table: SELECT default_portfolio_id FROM settings LIMIT 1
-    """
+    engine = get_engine()
     try:
-        conn = _connect_for_settings()
-        cur = conn.cursor()
-        # wide-style
-        try:
-            row = cur.execute("SELECT default_portfolio_id FROM settings LIMIT 1;").fetchone()
-            if row and row[0] is not None:
-                return int(row[0])
-        except Exception:
-            pass
-        # key/value
-        try:
-            row = cur.execute(
-                "SELECT value FROM settings WHERE key IN ('default_portfolio_id','DEFAULT_PORTFOLIO_ID') LIMIT 1;"
-            ).fetchone()
-            if row and row[0] is not None and str(row[0]).strip() != "":
-                return int(str(row[0]))
-        except Exception:
-            pass
+        with engine.connect() as conn:
+            r = conn.execute(text("SELECT value FROM global_settings WHERE key IN ('default_portfolio_id','DEFAULT_PORTFOLIO_ID') LIMIT 1")).fetchone()
+            if r and r[0] is not None and str(r[0]).strip():
+                return int(str(r[0]).strip())
+            r2 = conn.execute(text("SELECT value FROM settings WHERE key IN ('default_portfolio_id','DEFAULT_PORTFOLIO_ID') LIMIT 1")).fetchone()
+            if r2 and r2[0] is not None and str(r2[0]).strip():
+                return int(str(r2[0]).strip())
     except Exception:
         return None
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
     return None
-
-def _connect_for_settings():
-    return sqlite3.connect(DB_PATH)
 
 # =========================
 # Streamlit UI
@@ -319,13 +422,16 @@ def _connect_for_settings():
 def portfolio_tab():
     st.subheader("📁 Portfolio")
 
-    trades = load_trades(DB_PATH)
+    base = _get_base_currency()
+    st.caption(f"Values shown in base currency: **{base}**")
+
+    trades = load_trades(None)
     if trades.empty:
         st.info("No trades found. Add trades in the Trade Blotter.")
         return
 
     try:
-        backfill_yahoo_symbols(DB_PATH, trades)
+        backfill_yahoo_symbols(None, trades)
     except Exception:
         pass
 
@@ -334,7 +440,7 @@ def portfolio_tab():
         st.info("No open positions (net quantity is zero).")
         return
 
-    pf = load_portfolios(DB_PATH)
+    pf = load_portfolios(None)
     if not pf.empty and "portfolio_id" in pos.columns:
         pf_small = pf[["portfolio_id","portfolio_name"]].drop_duplicates()
         pos = pos.merge(pf_small, on="portfolio_id", how="left", suffixes=("", "_canon"))
@@ -342,22 +448,20 @@ def portfolio_tab():
     else:
         pos["portfolio_label"] = pos["trade_portfolio_name"]
 
-    # Build list of selectable portfolios (NO "All" option)
+    # Determine default selection from settings (by id if present)
     labels = (
         pos[["portfolio_id","portfolio_label"]]
         .drop_duplicates()
         .sort_values(by=["portfolio_label"])
         .reset_index(drop=True)
     )
-
-    # Determine default selection from settings (by id if present)
     default_pid = _read_default_portfolio_id()
     default_index = 0
     if default_pid is not None:
         try:
             default_index = labels.index[labels["portfolio_id"] == default_pid].tolist()[0]
         except Exception:
-            default_index = 0  # fallback if id not found in current list
+            default_index = 0
 
     sel_label = st.selectbox(
         "Portfolio",
@@ -368,17 +472,17 @@ def portfolio_tab():
     # Filter to the selected portfolio only
     pos = pos[pos["portfolio_label"] == sel_label]
 
-    # Value positions
+    # Value positions (base)
     valued = value_positions(pos)
 
     # Summary bar
     _render_summary_bar(valued)
 
-    # Holdings table
+    # Holdings table (base)
     st.markdown("#### Holdings")
     holdings_view = valued[[
-        "display_ticker","currency","effective_symbol",
-        "current_qty","avg_book_price","live_price","book_value","market_value","gain_loss","return_pct"
+        "display_ticker","currency","effective_symbol","current_qty","live_price_native",
+        "book_value_base","market_value_base","gain_loss_base","return_pct_base"
     ]]
     st.dataframe(_format_holdings(holdings_view), use_container_width=True, hide_index=True)
 
@@ -392,28 +496,29 @@ def portfolio_tab():
 
     if st.session_state.get("export_holdings_ready"):
         export_df = valued.copy()
-        for c in ["current_qty","avg_book_price","live_price","book_value","market_value","gain_loss","return_pct"]:
+        numeric_cols = ["current_qty","book_value_base","market_value_base","gain_loss_base","return_pct_base","live_price_native"]
+        for c in numeric_cols:
             if c in export_df.columns:
                 export_df[c] = pd.to_numeric(export_df[c], errors="coerce")
 
-        book_total = pd.to_numeric(export_df["book_value"], errors="coerce").sum()
-        mkt_total  = pd.to_numeric(export_df["market_value"], errors="coerce").sum()
-        gl_total   = pd.to_numeric(export_df["gain_loss"], errors="coerce").sum()
+        book_total = pd.to_numeric(export_df["book_value_base"], errors="coerce").sum()
+        mkt_total  = pd.to_numeric(export_df["market_value_base"], errors="coerce").sum()
+        gl_total   = pd.to_numeric(export_df["gain_loss_base"], errors="coerce").sum()
         ret_pct    = (gl_total / book_total * 100.0) if (book_total not in (None, 0) and pd.notna(book_total)) else None
 
         summary_df = pd.DataFrame([{
             "Portfolio": sel_label,
-            "Book Value": book_total,
-            "Market Value": mkt_total,
-            "Gain/Loss": gl_total,
+            "Book Value (Base)": book_total,
+            "Market Value (Base)": mkt_total,
+            "Gain/Loss (Base)": gl_total,
             "Return %": (None if ret_pct is None else ret_pct)
         }])
 
         bio = BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
             cols_order = [
-                "display_ticker","currency","effective_symbol",
-                "current_qty","avg_book_price","live_price","book_value","market_value","gain_loss","return_pct"
+                "display_ticker","currency","effective_symbol","current_qty","live_price_native",
+                "book_value_base","market_value_base","gain_loss_base","return_pct_base"
             ]
             cols_order = [c for c in cols_order if c in export_df.columns]
             export_df.to_excel(writer, index=False, sheet_name="Holdings", columns=cols_order)
