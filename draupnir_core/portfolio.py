@@ -481,7 +481,7 @@ def portfolio_tab():
     # Holdings table (base)
     st.markdown("#### Holdings")
     holdings_view = valued[[
-        "display_ticker","currency","effective_symbol","current_qty","live_price_native",
+        "display_ticker","currency","current_qty","live_price_native",
         "book_value_base","market_value_base","gain_loss_base","return_pct_base"
     ]]
     st.dataframe(_format_holdings(holdings_view), use_container_width=True, hide_index=True)
@@ -517,7 +517,7 @@ def portfolio_tab():
         bio = BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
             cols_order = [
-                "display_ticker","currency","effective_symbol","current_qty","live_price_native",
+                "display_ticker","currency","current_qty","live_price_native",
                 "book_value_base","market_value_base","gain_loss_base","return_pct_base"
             ]
             cols_order = [c for c in cols_order if c in export_df.columns]

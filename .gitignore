@@ -6,6 +6,7 @@ __pycache__/
 
 # Env & secrets
 *.key
+.env
 
 # IDE/OS
 .vscode/

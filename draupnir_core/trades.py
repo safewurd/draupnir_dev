@@ -1,5 +1,5 @@
 from functools import lru_cache
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Dict, Tuple
 
 import pandas as pd
@@ -44,21 +44,6 @@ def resolve_yahoo_symbol(ticker: str, currency: str) -> Optional[str]:
     if _has_price_data(t):
         return t
     return t
-
-# -----------------------------
-# FX: USDCAD fetch (cached)
-# -----------------------------
-
-@st.cache_data(show_spinner=False, ttl=300)  # 5 minutes
-def _fetch_usdcad() -> Optional[float]:
-    try:
-        hist = yf.Ticker("USDCAD=X").history(period="1d", auto_adjust=False, actions=False, raise_errors=False)
-        if hist.empty or "Close" not in hist.columns:
-            return None
-        close = hist["Close"].dropna()
-        return float(close.iloc[-1]) if not close.empty else None
-    except Exception:
-        return None
 
 def _table_columns(table: str) -> List[str]:
     insp = inspect(get_engine())
@@ -105,30 +90,33 @@ def get_portfolio_by_name(name: str) -> Optional[dict]:
 def _calc_trade_values(currency: str, price: float, quantity: float) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     """
     Returns (trade_value_cad, trade_value_usd, trade_usdcad)
+
+    NOTE: This is still called at INSERT time to persist the values once.
     """
+    # We no longer expose a UI button to mass-recalculate after insert.
+    # If you ever restore that, wire a batch updater to call this logic.
+    import yfinance as _yf  # local import to avoid polluting module scope
+    try:
+        hist = _yf.Ticker("USDCAD=X").history(period="1d", auto_adjust=False, actions=False, raise_errors=False)
+        fx = float(hist["Close"].dropna().iloc[-1]) if (not hist.empty and "Close" in hist.columns) else None
+    except Exception:
+        fx = None
+
     ccy = (currency or "").upper().strip()
     px  = float(price or 0.0)
     qty = float(quantity or 0.0)
 
     if px <= 0 or qty <= 0 or ccy not in ("CAD", "USD"):
-        return None, None, None
-
-    usdcad = _fetch_usdcad() or None
+        return None, None, fx
 
     if ccy == "CAD":
         val_cad = px * qty
-        if usdcad and usdcad > 0:
-            val_usd = val_cad / usdcad
-        else:
-            val_usd = None
+        val_usd = (val_cad / fx) if (fx and fx > 0) else None
     else:  # USD
         val_usd = px * qty
-        if usdcad and usdcad > 0:
-            val_cad = val_usd * usdcad
-        else:
-            val_cad = None
+        val_cad = (val_usd * fx) if (fx and fx > 0) else None
 
-    return (val_cad, val_usd, usdcad)
+    return (val_cad, val_usd, fx)
 
 def insert_trade(row: dict) -> int:
     """
@@ -138,7 +126,7 @@ def insert_trade(row: dict) -> int:
     cols_in_db = _table_columns("trades")
     payload: Dict[str, object] = {}
 
-    # Compute trade values
+    # Compute trade values once at insert
     tval_cad, tval_usd, t_usdcad = _calc_trade_values(
         row.get("currency"), row.get("price"), row.get("quantity")
     )
@@ -157,7 +145,7 @@ def insert_trade(row: dict) -> int:
         # optional legacy columns:
         "account_number": row.get("account_number"),
         "created_at": row.get("created_at"),
-        # new columns:
+        # persisted values:
         "trade_value_cad": tval_cad,
         "trade_value_usd": tval_usd,
         "trade_usdcad": t_usdcad,
@@ -201,77 +189,8 @@ def _load_recent(limit: int = 200) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def _load_all_trades() -> pd.DataFrame:
-    engine = get_engine()
-    try:
-        return pd.read_sql(
-            "SELECT trade_id, portfolio_id, portfolio_name, ticker, currency, action, "
-            "quantity, price, commission, yahoo_symbol, trade_date, "
-            "trade_value_cad, trade_value_usd, trade_usdcad "
-            "FROM trades ORDER BY trade_id ASC;",
-            engine
-        )
-    except Exception:
-        return pd.DataFrame()
-
 # -----------------------------
-# Backfill utility (NEW)
-# -----------------------------
-
-def recalc_trade_values_for_all_trades() -> int:
-    """
-    Recalculate trade_value_cad/usd/usdcad for all rows and persist.
-    Returns number of rows updated.
-    """
-    engine = get_engine()
-    df = _load_all_trades()
-    if df.empty:
-        return 0
-
-    usdcad = _fetch_usdcad() or None
-    if usdcad is None or usdcad <= 0:
-        # still proceed row-by-row (maybe some CAD-only rows)
-        pass
-
-    updates: List[dict] = []
-    for _, r in df.iterrows():
-        ccy = str(r.get("currency", "")).upper().strip()
-        px  = float(r.get("price") or 0.0)
-        qty = float(r.get("quantity") or 0.0)
-
-        if px <= 0 or qty <= 0 or ccy not in ("CAD", "USD"):
-            continue
-
-        if ccy == "CAD":
-            val_cad = px * qty
-            val_usd = (val_cad / usdcad) if (usdcad and usdcad > 0) else None
-        else:
-            val_usd = px * qty
-            val_cad = (val_usd * usdcad) if (usdcad and usdcad > 0) else None
-
-        updates.append({
-            "tvc": val_cad,
-            "tvu": val_usd,
-            "fx":  usdcad,
-            "id":  int(r["trade_id"]),
-        })
-
-    if not updates:
-        return 0
-
-    with engine.begin() as conn:
-        conn.execute(text("""
-            UPDATE trades
-               SET trade_value_cad = :tvc,
-                   trade_value_usd = :tvu,
-                   trade_usdcad    = :fx
-             WHERE trade_id = :id
-        """), updates)
-
-    return len(updates)
-
-# -----------------------------
-# UI (unchanged core, shows new fields in Recent table)
+# UI (same core functionality, backfill removed)
 # -----------------------------
 
 def _validate_inputs(portfolio_name, ticker, currency, action, quantity, price) -> list[str]:
@@ -385,11 +304,11 @@ def trades_tab():
                     FROM trades WHERE trade_id = :id
                 """), {"id": trade_id}).fetchone()
             if rec:
-                st.caption(f"Calculated: CAD {rec[0]!s} | USD {rec[1]!s} | USDCAD {rec[2]!s}")
+                st.caption(f"Calculated at insert: CAD {rec[0]!s} | USD {rec[1]!s} | USDCAD {rec[2]!s}")
         except Exception:
             pass
 
-    # ---- Recent trades (now includes the 3 new columns) ----
+    # ---- Recent trades (includes persisted value columns) ----
     st.markdown("#### Recent Trades")
     try:
         recent = _load_recent(25)
@@ -403,14 +322,4 @@ def trades_tab():
     except Exception as ex:
         st.warning(f"Could not load recent trades: {ex}")
 
-    # ---- Backfill button (optional) ----
-    st.markdown("### 🔄 Recalculate Values for All Trades")
-    if st.button("Recalculate trade values", type="secondary"):
-        try:
-            n = recalc_trade_values_for_all_trades()
-            st.success(f"Updated {n} trades with current USDCAD.")
-            st.rerun()
-        except Exception as ex:
-            st.error(f"Backfill failed: {ex}")
-
-    # ---- Delete section remains unchanged (omitted here for brevity) ----
+    # (Backfill/recalculate section has been removed as requested)

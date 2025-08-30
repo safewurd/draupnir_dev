@@ -87,7 +87,7 @@ Run app / make changes
 Commit & push
 
 git add -A
-git commit -m "Describe your change"
+git commit -m "pushing env file"
 git push
 
 🗄 Database Files
